@@ -1306,6 +1306,14 @@ pub unsafe extern "C" fn profile_perf_counters_rs(
     per_warp_stalls_scoreboard_ptr: *const u64,
     per_warp_stalls_busy_ptr: *const u64,
     per_warp_stalls_busy_lsu_ptr: *const u64,
+    per_warp_unoccupied_ptr: *const u64,
+    per_warp_idle_ptr: *const u64,
+    per_warp_ifetch_ptr: *const u64,
+    per_warp_control_ptr: *const u64,
+    per_warp_sync_ptr: *const u64,
+    per_warp_mem_data_ptr: *const u64,
+    per_warp_com_data_ptr: *const u64,
+    per_warp_struct_ptr: *const u64,
     finished: u8,
 ) {
     let mut context_guard = CELL.write().unwrap();
@@ -1329,6 +1337,14 @@ pub unsafe extern "C" fn profile_perf_counters_rs(
     let per_warp_stalls_scoreboard = unsafe { std::slice::from_raw_parts(per_warp_stalls_scoreboard_ptr, config.num_warps) };
     let per_warp_stalls_busy = unsafe { std::slice::from_raw_parts(per_warp_stalls_busy_ptr, config.num_warps) };
     let per_warp_stalls_busy_lsu = unsafe { std::slice::from_raw_parts(per_warp_stalls_busy_lsu_ptr, config.num_warps) };
+    let per_warp_unoccupied = unsafe { std::slice::from_raw_parts(per_warp_unoccupied_ptr, config.num_warps) };
+    let per_warp_idle = unsafe { std::slice::from_raw_parts(per_warp_idle_ptr, config.num_warps) };
+    let per_warp_ifetch = unsafe { std::slice::from_raw_parts(per_warp_ifetch_ptr, config.num_warps) };
+    let per_warp_control = unsafe { std::slice::from_raw_parts(per_warp_control_ptr, config.num_warps) };
+    let per_warp_sync = unsafe { std::slice::from_raw_parts(per_warp_sync_ptr, config.num_warps) };
+    let per_warp_mem_data = unsafe { std::slice::from_raw_parts(per_warp_mem_data_ptr, config.num_warps) };
+    let per_warp_com_data = unsafe { std::slice::from_raw_parts(per_warp_com_data_ptr, config.num_warps) };
+    let per_warp_struct = unsafe { std::slice::from_raw_parts(per_warp_struct_ptr, config.num_warps) };
     let all_warp_cycles_decoded: u64 = per_warp_cycles_decoded.iter().sum();
     let all_warp_cycles_issued: u64 = per_warp_cycles_issued.iter().sum();
     let all_warp_stalls_waw: u64 = per_warp_stalls_waw.iter().sum();
@@ -1342,6 +1358,27 @@ pub unsafe extern "C" fn profile_perf_counters_rs(
     let avg_warp_stalls_busy = all_warp_stalls_busy as f32 / all_warp_cycles_issued as f32;
     let avg_warp_stalls_busy_lsu = all_warp_stalls_busy_lsu as f32 / all_warp_cycles_issued as f32;
     let avg_decoded_warps = all_warp_cycles_decoded as f32 / cycles as f32;
+
+    // GCStack-style per-warp-cycle stall stack (Philosophy B): every bucket
+    // is normalized by total cycles (not cycles_issued), so they represent
+    // "average warps in this state per cycle" and should sum to num_warps.
+    let all_warp_unoccupied: u64 = per_warp_unoccupied.iter().sum();
+    let all_warp_idle: u64 = per_warp_idle.iter().sum();
+    let all_warp_ifetch: u64 = per_warp_ifetch.iter().sum();
+    let all_warp_control: u64 = per_warp_control.iter().sum();
+    let all_warp_sync: u64 = per_warp_sync.iter().sum();
+    let all_warp_mem_data: u64 = per_warp_mem_data.iter().sum();
+    let all_warp_com_data: u64 = per_warp_com_data.iter().sum();
+    let all_warp_struct: u64 = per_warp_struct.iter().sum();
+    let avg_base = all_warp_cycles_issued as f32 / cycles as f32;
+    let avg_unoccupied = all_warp_unoccupied as f32 / cycles as f32;
+    let avg_idle = all_warp_idle as f32 / cycles as f32;
+    let avg_ifetch = all_warp_ifetch as f32 / cycles as f32;
+    let avg_control = all_warp_control as f32 / cycles as f32;
+    let avg_sync = all_warp_sync as f32 / cycles as f32;
+    let avg_mem_data = all_warp_mem_data as f32 / cycles as f32;
+    let avg_com_data = all_warp_com_data as f32 / cycles as f32;
+    let avg_struct = all_warp_struct as f32 / cycles as f32;
 
     let ipc = inst_retired as f32 / cycles as f32;
     let frac = |cycle: u64| cycle as f32 / cycles as f32;
@@ -1371,6 +1408,16 @@ pub unsafe extern "C" fn profile_perf_counters_rs(
     println!(" └─ avg. stalls due to busy FUs: {:.2}", avg_warp_stalls_busy);
     println!("    └─ busy LSU: {:.2}", avg_warp_stalls_busy_lsu);
     println!(" IPC: {:.3}", ipc);
+    println!(" GCStack (avg. warps in state per cycle):");
+    println!(" ├─ base (issued): {:.2}", avg_base);
+    println!(" ├─ unoccupied: {:.2}", avg_unoccupied);
+    println!(" ├─ idle: {:.2}", avg_idle);
+    println!(" ├─ ifetch: {:.2}", avg_ifetch);
+    println!(" ├─ control: {:.2}", avg_control);
+    println!(" ├─ sync: {:.2}", avg_sync);
+    println!(" ├─ memData: {:.2}", avg_mem_data);
+    println!(" ├─ comData: {:.2}", avg_com_data);
+    println!(" └─ struct: {:.2}", avg_struct);
     println!("╘═══════════════════════════╛");
     println!("");
 }
