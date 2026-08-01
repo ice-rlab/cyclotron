@@ -9,7 +9,7 @@ use crate::neutrino::neutrino::Neutrino;
 use crate::sim::flat_mem::FlatMemory;
 use crate::sim::log::Logger;
 use crate::sim::perf_log::PerfLogSession;
-use crate::sim::trace::Tracer;
+use crate::sim::trace::{MemTracer, Tracer};
 use crate::timeflow::{ClusterGmemGraph, CoreGraphConfig};
 use crate::timeq::module_now;
 use std::iter::zip;
@@ -22,10 +22,11 @@ pub struct MuonCore {
     base: ModuleBase<MuonState, MuonConfig>,
     pub scheduler: Scheduler,
     pub warps: Vec<Warp>,
-    pub(crate) shared_mem: FlatMemory,
+    pub(crate) shared_mem: Arc<RwLock<FlatMemory>>,
 
     logger: Arc<Logger>,
     tracer: Arc<Tracer>,
+    mem_tracer: Arc<MemTracer>,
     timing_mode: TimingMode,
 }
 
@@ -41,6 +42,7 @@ impl MuonCore {
         core_id: usize,
         logger: &Arc<Logger>,
         gmem: Arc<RwLock<FlatMemory>>,
+        shared_mem: Arc<RwLock<FlatMemory>>,
         timing_mode: TimingMode,
     ) -> Self {
         let num_warps = config.num_warps;
@@ -64,9 +66,10 @@ impl MuonCore {
                     )
                 })
                 .collect(),
-            shared_mem: FlatMemory::new_with_size(config.smem_size, None),
+            shared_mem,
             logger: logger.clone(),
             tracer: Arc::new(Tracer::new(&config)),
+            mem_tracer: Arc::new(MemTracer::new()),
             timing_mode,
         };
 
@@ -85,6 +88,7 @@ impl MuonCore {
         core_id: usize,
         logger: &Arc<Logger>,
         gmem: Arc<RwLock<FlatMemory>>,
+        shared_mem: Arc<RwLock<FlatMemory>>,
     ) -> Self {
         Self::build_core(
             config,
@@ -92,6 +96,7 @@ impl MuonCore {
             core_id,
             logger,
             gmem,
+            shared_mem,
             TimingMode::Disabled,
         )
     }
@@ -102,6 +107,7 @@ impl MuonCore {
         core_id: usize,
         logger: &Arc<Logger>,
         gmem: Arc<RwLock<FlatMemory>>,
+        shared_mem: Arc<RwLock<FlatMemory>>,
         timing_config: CoreGraphConfig,
         timing_core_id: usize,
         timing_cluster_id: usize,
@@ -118,7 +124,15 @@ impl MuonCore {
             perf_log_session,
             logger.clone(),
         ));
-        Self::build_core(config, cluster_id, core_id, logger, gmem, timing_mode)
+        Self::build_core(
+            config,
+            cluster_id,
+            core_id,
+            logger,
+            gmem,
+            shared_mem,
+            timing_mode,
+        )
     }
 
     /// Spawn a single warp to this core.
@@ -197,6 +211,8 @@ impl MuonCore {
     pub fn backend(&mut self, ibuf: &InstBuf, neutrino: &mut Neutrino) -> Result<(), ExecErr> {
         let now = module_now(&self.scheduler);
         let mut writebacks: Vec<Option<Writeback>> = Vec::with_capacity(self.warps.len());
+        let mut mem_trace_lines = Vec::new();
+        let shared_mem = Arc::clone(&self.shared_mem);
 
         match &mut self.timing_mode {
             TimingMode::Enabled(timing_model) => {
@@ -225,11 +241,13 @@ impl MuonCore {
                                 self.scheduler.replay_instruction(wid);
                                 None
                             } else {
+                                let mut shared_mem =
+                                    shared_mem.write().expect("shared memory lock poisoned");
                                 warp.backend_timed(
                                     ib,
                                     &mut self.scheduler,
                                     neutrino,
-                                    &mut self.shared_mem,
+                                    &mut *shared_mem,
                                     timing_model,
                                     now,
                                 )?
@@ -237,6 +255,10 @@ impl MuonCore {
                         }
                         None => None,
                     };
+                    if let Some((_, warp_mem_trace_lines)) = &wb_opt {
+                        mem_trace_lines.extend(warp_mem_trace_lines.iter().cloned());
+                    }
+                    let wb_opt = wb_opt.map(|(wb, _)| wb);
                     writebacks.push(wb_opt);
                 }
             }
@@ -246,14 +268,22 @@ impl MuonCore {
 
                 for (warp, ibuf_entry) in zip(warps, ibuf_entries) {
                     let wb_opt = match ibuf_entry {
-                        Some(ib) => Some(warp.backend(
-                            ib,
-                            &mut self.scheduler,
-                            neutrino,
-                            &mut self.shared_mem,
-                        )?),
+                        Some(ib) => {
+                            let mut shared_mem =
+                                shared_mem.write().expect("shared memory lock poisoned");
+                            Some(warp.backend(
+                                ib,
+                                &mut self.scheduler,
+                                neutrino,
+                                &mut *shared_mem,
+                            )?)
+                        }
                         None => None,
                     };
+                    if let Some((_, warp_mem_trace_lines)) = &wb_opt {
+                        mem_trace_lines.extend(warp_mem_trace_lines.iter().cloned());
+                    }
+                    let wb_opt = wb_opt.map(|(wb, _)| wb);
                     writebacks.push(wb_opt);
                 }
             }
@@ -261,6 +291,8 @@ impl MuonCore {
 
         let tracer = Arc::get_mut(&mut self.tracer).expect("failed to get tracer");
         tracer.record(&writebacks);
+        let mem_tracer = Arc::get_mut(&mut self.mem_tracer).expect("failed to get mem tracer");
+        mem_tracer.record(&mem_trace_lines);
 
         self.scheduler.tick_one();
         self.warps.iter_mut().for_each(Warp::tick_one);
@@ -276,12 +308,14 @@ impl MuonCore {
         tmask: u32,
         neutrino: &mut Neutrino,
     ) -> Writeback {
-        let writeback = self.warps[warp_id].execute(
+        let shared_mem = Arc::clone(&self.shared_mem);
+        let mut shared_mem = shared_mem.write().expect("shared memory lock poisoned");
+        let (writeback, _) = self.warps[warp_id].execute(
             issued,
             tmask,
             &mut self.scheduler,
             neutrino,
-            &mut self.shared_mem,
+            &mut *shared_mem,
         );
         self.warps[warp_id].tick_one();
 
@@ -308,6 +342,14 @@ impl MuonCore {
 
     pub fn get_tracer(&self) -> &Tracer {
         &self.tracer
+    }
+
+    pub fn get_mem_tracer_mut(&mut self) -> &mut MemTracer {
+        Arc::get_mut(&mut self.mem_tracer).expect("failed to get mem tracer")
+    }
+
+    pub fn get_mem_tracer(&self) -> &MemTracer {
+        &self.mem_tracer
     }
 
     pub fn timing_summary(&self) -> CorePerfSummary {

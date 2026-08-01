@@ -1,11 +1,13 @@
 // #![allow(dead_code, unreachable_code)]
 use crate::base::behavior::*;
 use crate::base::module::IsModule;
+use crate::dpi::lsu::CyclotronLsuModel;
 use crate::dpi::tile::PipelineContext;
 use crate::muon::core::MuonCore;
 use crate::muon::decode::{DecodedInst, MicroOp};
 use crate::sim::top::Sim;
 use crate::sim::trace;
+use crate::sim::trace_db::{create_new_db_overwrite, default_trace_db_path};
 use crate::ui::CyclotronArgs;
 use log::debug;
 use rusqlite::Connection;
@@ -39,6 +41,7 @@ struct Context {
     trace_memory_queue_dmem: Vec<MemQueue>,
     trace_memory_queue_smem: Vec<MemQueue>,
     pipeline_context: PipelineContext,
+    lsu_models: Vec<Option<CyclotronLsuModel>>,
     cycles_after_cyclotron_finished: usize,
     prev_rtl_finished: Vec<bool>,
     executed_insts: Vec<usize>,
@@ -77,6 +80,8 @@ struct MemQueueLine {
     cluster_id: u32,
     core_id: u32,
     lane_id: u32,
+    req_cycle: u64,
+    resp_cycle: Option<u64>,
     store: bool,
     address: u32,
     size: u8,
@@ -130,25 +135,23 @@ pub extern "C" fn cyclotron_init_rs(c_elfname: *const c_char, c_trace_db_path: *
         if c_trace_db_path.is_null() {
             String::new()
         } else {
-            CStr::from_ptr(c_trace_db_path).to_string_lossy().into_owned()
+            CStr::from_ptr(c_trace_db_path)
+                .to_string_lossy()
+                .into_owned()
         }
     };
     let mut cyclotron_args = CyclotronArgs::default();
     if !elfname.is_empty() {
         cyclotron_args.binary_path = Some(PathBuf::from(&elfname));
     }
-    let trace_db_path = if !trace_db_path_arg.is_empty() {
-        PathBuf::from(trace_db_path_arg)
-    } else if elfname.is_empty() {
-        PathBuf::from("cyclotron_trace.sqlite")
-    } else {
-        let trace_db_name = PathBuf::from(&elfname)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| name.strip_suffix(".elf").unwrap_or(name).to_owned())
-            .unwrap_or_else(|| "cyclotron_trace".to_owned());
-        PathBuf::from(format!("{trace_db_name}.sqlite"))
-    };
+    let trace_db_path = default_trace_db_path(
+        (!trace_db_path_arg.is_empty())
+            .then(|| PathBuf::from(&trace_db_path_arg))
+            .as_deref(),
+        (!elfname.is_empty())
+            .then(|| PathBuf::from(&elfname))
+            .as_deref(),
+    );
 
     // make separate sim instances for the golden ISA model and the backend model to prevent
     // double-execution on the same GMEM
@@ -174,6 +177,9 @@ pub extern "C" fn cyclotron_init_rs(c_elfname: *const c_char, c_trace_db_path: *
         trace_memory_queue_dmem: Vec::new(),
         trace_memory_queue_smem: Vec::new(),
         pipeline_context: PipelineContext::new(config.num_lanes),
+        lsu_models: (0..NUM_CLUSTERS * CORES_PER_CLUSTER)
+            .map(|_| None)
+            .collect(),
         cycles_after_cyclotron_finished: 0,
         prev_rtl_finished: vec![false; NUM_CLUSTERS * CORES_PER_CLUSTER],
         executed_insts: vec![0; NUM_CLUSTERS * CORES_PER_CLUSTER],
@@ -647,7 +653,11 @@ pub unsafe fn cyclotron_backend_rs(
     debug!("issue warp id is {}", issue_warp_id);
     debug!("{}", decoded);
 
-    let writeback = core.warps[issue_warp_id as usize]
+    let mut shared_mem = core
+        .shared_mem
+        .write()
+        .expect("shared memory lock poisoned");
+    let (writeback, _) = core.warps[issue_warp_id as usize]
         .backend(
             MicroOp {
                 inst: decoded,
@@ -655,7 +665,7 @@ pub unsafe fn cyclotron_backend_rs(
             },
             &mut core.scheduler,
             neutrino,
-            &mut core.shared_mem,
+            &mut *shared_mem,
         )
         .expect("uh");
     // let writeback = core.execute(issue_warp_id.into(), issued, issue_tmask, neutrino);
@@ -702,18 +712,19 @@ pub unsafe fn cyclotron_backend_rs(
 pub unsafe extern "C" fn cyclotron_trace_rs(
     cluster_id: u32,
     core_id: u32,
+    cycle: u64,
     inst_valid: u8,
     inst_pc: u32,
     inst_warp_id: u32,
     _inst_tmask: u32,
     _inst_rs1_enable: u8,
-    _inst_rs1_address: u8,
+    _inst_rs1_address: u32,
     inst_rs1_data_vec: *const u32,
     _inst_rs2_enable: u8,
-    _inst_rs2_address: u8,
+    _inst_rs2_address: u32,
     inst_rs2_data_vec: *const u32,
     _inst_rs3_enable: u8,
-    _inst_rs3_address: u8,
+    _inst_rs3_address: u32,
     inst_rs3_data_vec: *const u32,
     dmem_req_valid_vec: *const u8,
     dmem_req_bits_store_vec: *const u8,
@@ -743,8 +754,8 @@ pub unsafe extern "C" fn cyclotron_trace_rs(
     let num_lanes = context.sim_isa.top.clusters[0].cores[0].conf().num_lanes;
     let global_core_id = cluster_id as usize * CORES_PER_CLUSTER + core_id as usize;
 
-    let _inst_rs1_data = unsafe { from_raw_parts(inst_rs1_data_vec, num_lanes) };
-    let _inst_rs2_data = unsafe { from_raw_parts(inst_rs2_data_vec, num_lanes) };
+    let inst_rs1_data = unsafe { from_raw_parts(inst_rs1_data_vec, num_lanes) };
+    let inst_rs2_data = unsafe { from_raw_parts(inst_rs2_data_vec, num_lanes) };
     let _inst_rs3_data = unsafe { from_raw_parts(inst_rs3_data_vec, num_lanes) };
 
     let dmem_req_valid = unsafe { from_raw_parts(dmem_req_valid_vec, num_lanes) };
@@ -792,12 +803,12 @@ pub unsafe extern "C" fn cyclotron_trace_rs(
             *conn_opt = Some(create_new_db_overwrite(&context.trace_db_path));
         }
 
-        let rs1_string = _inst_rs1_data
+        let rs1_string = inst_rs1_data
             .iter()
             .map(u32::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        let rs2_string = _inst_rs2_data
+        let rs2_string = inst_rs2_data
             .iter()
             .map(u32::to_string)
             .collect::<Vec<_>>()
@@ -808,11 +819,12 @@ pub unsafe extern "C" fn cyclotron_trace_rs(
                 .as_ref()
                 .expect("trace connection not initialized")
                 .execute(
-                    "INSERT INTO inst (cluster_id, core_id, warp, pc, lane_mask, has_rs1, rs1_id, rs1_data, has_rs2, rs2_id, rs2_data)
-                                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    "INSERT INTO inst (cluster_id, core_id, cycle, warp, pc, lane_mask, has_rs1, rs1_id, rs1_data, has_rs2, rs2_id, rs2_data)
+                                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     (
                         cluster_id,
                         core_id,
+                        cycle_to_sql(cycle),
                         inst_warp_id,
                         inst_pc,
                         _inst_tmask,
@@ -842,6 +854,7 @@ pub unsafe extern "C" fn cyclotron_trace_rs(
             dmem_resp_valid,
             dmem_resp_bits_tag,
             dmem_resp_bits_data,
+            cycle,
             false,
         );
 
@@ -860,6 +873,7 @@ pub unsafe extern "C" fn cyclotron_trace_rs(
             smem_resp_valid,
             smem_resp_bits_tag,
             smem_resp_bits_data,
+            cycle,
             true,
         );
     });
@@ -881,6 +895,14 @@ fn shift_data_to_lsb(data: u32, address: u32, size: u8) -> u32 {
     data_shifted & mask
 }
 
+fn cycle_to_sql(cycle: u64) -> i64 {
+    assert!(
+        cycle <= i64::MAX as u64,
+        "trace cycle exceeds SQLite INTEGER range"
+    );
+    cycle as i64
+}
+
 fn record_mem_bundle(
     conn: &Connection,
     queue: &mut MemQueue,
@@ -895,6 +917,7 @@ fn record_mem_bundle(
     resp_valid: &[u8],
     resp_tag: &[u32],
     resp_data: &[u32],
+    cycle: u64,
     is_smem: bool,
 ) {
     // request
@@ -914,6 +937,8 @@ fn record_mem_bundle(
                 cluster_id,
                 core_id,
                 lane_id: i as u32,
+                req_cycle: cycle,
+                resp_cycle: None,
                 store,
                 address,
                 size,
@@ -934,7 +959,7 @@ fn record_mem_bundle(
         let tag = resp_tag[i];
         let lane = i as u32;
         let data = resp_data[i];
-        match_response_in_mem_queue(queue, tag, lane, data);
+        match_response_in_mem_queue(queue, tag, lane, data, cycle);
     }
 
     if any_valid_response {
@@ -954,6 +979,7 @@ fn match_response_in_mem_queue(
     resp_tag: u32,
     resp_lane: u32,
     resp_data: u32,
+    resp_cycle: u64,
 ) {
     // iter_mut() equals the enqueue order
     let mut one_or_more_match = false;
@@ -972,6 +998,7 @@ fn match_response_in_mem_queue(
         }
 
         line.checked = true;
+        line.resp_cycle = Some(resp_cycle);
         one_or_more_match = true;
         break;
     }
@@ -1007,13 +1034,17 @@ fn record_mem_req_to_db(conn: &Connection, line: &MemQueueLine, is_smem: bool) {
     conn.execute(
         &format!(
             "INSERT INTO {mem}
-                    (cluster_id, core_id, lane_id, store, address, size, data)
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                    (cluster_id, core_id, lane_id, req_cycle, resp_cycle, store, address, size, data)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
         ),
         (
             line.cluster_id,
             line.core_id,
             line.lane_id,
+            cycle_to_sql(line.req_cycle),
+            line.resp_cycle
+                .map(cycle_to_sql)
+                .expect("memory trace line missing response cycle"),
             line.store,
             line.address,
             line.size,
@@ -1021,69 +1052,6 @@ fn record_mem_req_to_db(conn: &Connection, line: &MemQueueLine, is_smem: bool) {
         ),
     )
     .expect("failed to insert to inst");
-}
-
-fn create_new_db_overwrite(db_path: &PathBuf) -> Connection {
-    for suffix in ["", "-wal", "-shm"] {
-        let path = format!("{}{}", db_path.display(), suffix);
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => panic!("failed to remove existing trace database file {path}: {e}"),
-        }
-    }
-    let conn = Connection::open(db_path).expect("failed to open sqlite trace database");
-
-    conn.execute(
-        "CREATE TABLE inst (
-                    id    INTEGER PRIMARY KEY AUTOINCREMENT,
-                    cluster_id INTEGER NOT NULL,
-                    core_id    INTEGER NOT NULL,
-                    warp       INTEGER NOT NULL,
-                    pc         INTEGER NOT NULL,
-                    lane_mask  INTEGER NOT NULL,
-                    has_rs1    INTEGER NOT NULL,
-                    rs1_id     INTEGER NOT NULL,
-                    rs1_data   TEXT NOT NULL,
-                    has_rs2    INTEGER NOT NULL,
-                    rs2_id     INTEGER NOT NULL,
-                    rs2_data   TEXT NOT NULL
-                )",
-        (),
-    )
-    .expect("failed to create inst table");
-
-    conn.execute(
-        "CREATE TABLE dmem (
-                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                    cluster_id INTEGER NOT NULL,
-                    core_id    INTEGER NOT NULL,
-                    lane_id    INTEGER NOT NULL,
-                    store      INTEGER NOT NULL CHECK (store IN (0,1)),
-                    address    INTEGER NOT NULL,
-                    size       INTEGER NOT NULL,
-                    data       INTEGER NOT NULL
-                )",
-        (),
-    )
-    .expect("failed to create dmem table");
-
-    conn.execute(
-        "CREATE TABLE smem (
-                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                    cluster_id INTEGER NOT NULL,
-                    core_id    INTEGER NOT NULL,
-                    lane_id    INTEGER NOT NULL,
-                    store      INTEGER NOT NULL CHECK (store IN (0,1)),
-                    address    INTEGER NOT NULL,
-                    size       INTEGER NOT NULL,
-                    data       INTEGER NOT NULL
-                )",
-        (),
-    )
-    .expect("failed to create smem table");
-
-    conn
 }
 
 #[no_mangle]
@@ -1098,13 +1066,13 @@ pub unsafe extern "C" fn cyclotron_difftest_reg_rs(
     warp_id: u32,
     tmask: u32,
     rs1_enable: u8,
-    rs1_address: u8,
+    rs1_address: u32,
     rs1_data_vec: *const u32,
     rs2_enable: u8,
-    rs2_address: u8,
+    rs2_address: u32,
     rs2_data_vec: *const u32,
     rs3_enable: u8,
-    rs3_address: u8,
+    rs3_address: u32,
     rs3_data_vec: *const u32,
 ) {
     let mut context_guard = CELL.write().unwrap();
@@ -1165,7 +1133,7 @@ pub unsafe extern "C" fn cyclotron_difftest_reg_rs(
             panic!("DIFFTEST fail");
         }
 
-        let compare_reg_addr_and_exit = |_rtl: u8, _model: u8, _name: &str| {
+        let compare_reg_addr_and_exit = |_rtl: u32, _model: u8, _name: &str| {
             // register address check is disabled due to physical register renaming not being
             // implemented in cyclotron.  How registers are renamed is not specified in the ISA,
             // making hardening this in cyclotron awkward
@@ -1297,13 +1265,18 @@ pub unsafe extern "C" fn profile_perf_counters_rs(
     inst_retired: u64,
     cycles: u64,
     cycles_decoded: u64,
+    cycles_dispatched: u64,
     cycles_eligible: u64,
     cycles_issued: u64,
+    acc_rs_occupancy: u64,
     per_warp_cycles_decoded_ptr: *const u64,
+    per_warp_cycles_dispatched_ptr: *const u64,
+    per_warp_cycles_eligible_ptr: *const u64,
     per_warp_cycles_issued_ptr: *const u64,
     per_warp_stalls_waw_ptr: *const u64,
     per_warp_stalls_war_ptr: *const u64,
     per_warp_stalls_scoreboard_ptr: *const u64,
+    per_warp_stalls_rs_full_ptr: *const u64,
     per_warp_stalls_busy_ptr: *const u64,
     per_warp_stalls_busy_lsu_ptr: *const u64,
     per_warp_unoccupied_ptr: *const u64,
@@ -1331,10 +1304,13 @@ pub unsafe extern "C" fn profile_perf_counters_rs(
     }
 
     let per_warp_cycles_decoded = unsafe { std::slice::from_raw_parts(per_warp_cycles_decoded_ptr, config.num_warps) };
+    let per_warp_cycles_dispatched = unsafe { std::slice::from_raw_parts(per_warp_cycles_dispatched_ptr, config.num_warps) };
+    let per_warp_cycles_eligible = unsafe { std::slice::from_raw_parts(per_warp_cycles_eligible_ptr, config.num_warps) };
     let per_warp_cycles_issued = unsafe { std::slice::from_raw_parts(per_warp_cycles_issued_ptr, config.num_warps) };
     let per_warp_stalls_waw = unsafe { std::slice::from_raw_parts(per_warp_stalls_waw_ptr, config.num_warps) };
     let per_warp_stalls_war = unsafe { std::slice::from_raw_parts(per_warp_stalls_war_ptr, config.num_warps) };
     let per_warp_stalls_scoreboard = unsafe { std::slice::from_raw_parts(per_warp_stalls_scoreboard_ptr, config.num_warps) };
+    let per_warp_stalls_rs_full = unsafe { std::slice::from_raw_parts(per_warp_stalls_rs_full_ptr, config.num_warps) };
     let per_warp_stalls_busy = unsafe { std::slice::from_raw_parts(per_warp_stalls_busy_ptr, config.num_warps) };
     let per_warp_stalls_busy_lsu = unsafe { std::slice::from_raw_parts(per_warp_stalls_busy_lsu_ptr, config.num_warps) };
     let per_warp_unoccupied = unsafe { std::slice::from_raw_parts(per_warp_unoccupied_ptr, config.num_warps) };
@@ -1346,18 +1322,26 @@ pub unsafe extern "C" fn profile_perf_counters_rs(
     let per_warp_com_data = unsafe { std::slice::from_raw_parts(per_warp_com_data_ptr, config.num_warps) };
     let per_warp_struct = unsafe { std::slice::from_raw_parts(per_warp_struct_ptr, config.num_warps) };
     let all_warp_cycles_decoded: u64 = per_warp_cycles_decoded.iter().sum();
+    let all_warp_cycles_dispatched: u64 = per_warp_cycles_dispatched.iter().sum();
+    let all_warp_cycles_eligible: u64 = per_warp_cycles_eligible.iter().sum();
     let all_warp_cycles_issued: u64 = per_warp_cycles_issued.iter().sum();
     let all_warp_stalls_waw: u64 = per_warp_stalls_waw.iter().sum();
     let all_warp_stalls_war: u64 = per_warp_stalls_war.iter().sum();
     let all_warp_stalls_scoreboard: u64 = per_warp_stalls_scoreboard.iter().sum();
+    let all_warp_stalls_rs_full: u64 = per_warp_stalls_rs_full.iter().sum();
     let all_warp_stalls_busy: u64 = per_warp_stalls_busy.iter().sum();
     let all_warp_stalls_busy_lsu: u64 = per_warp_stalls_busy_lsu.iter().sum();
     let avg_warp_stalls_waw = all_warp_stalls_waw as f32 / all_warp_cycles_issued as f32;
     let avg_warp_stalls_war = all_warp_stalls_war as f32 / all_warp_cycles_issued as f32;
     let avg_warp_stalls_scoreboard = all_warp_stalls_scoreboard as f32 / all_warp_cycles_issued as f32;
+    let avg_warp_stalls_rs_full = all_warp_stalls_rs_full as f32 / all_warp_cycles_issued as f32;
     let avg_warp_stalls_busy = all_warp_stalls_busy as f32 / all_warp_cycles_issued as f32;
     let avg_warp_stalls_busy_lsu = all_warp_stalls_busy_lsu as f32 / all_warp_cycles_issued as f32;
+    let avg_warp_stalls_busy_other = avg_warp_stalls_busy - avg_warp_stalls_busy_lsu;
     let avg_decoded_warps = all_warp_cycles_decoded as f32 / cycles as f32;
+    let avg_dispatched_warps = all_warp_cycles_dispatched as f32 / cycles as f32;
+    let avg_eligible_warps = all_warp_cycles_eligible as f32 / cycles as f32;
+    let avg_inst_window = acc_rs_occupancy as f32 / cycles as f32;
 
     // GCStack-style per-warp-cycle stall stack (Philosophy B): every bucket
     // is normalized by total cycles (not cycles_issued), so they represent
@@ -1394,19 +1378,28 @@ pub unsafe extern "C" fn profile_perf_counters_rs(
     println!("╒═══════════════════════════╕");
     println!("│  Muon Performance Report  │");
     println!("├───────────────────────────┤");
+    println!("│     Cluster {} Core {}      │", cluster_id, core_id);
+    println!("├───────────────────────────┤");
     println!(" Instructions: {}", inst_retired);
     println!(" Cycles: {}", cycles);
-    println!(" ├─ with decoded insts: {} ({:.2}%)", cycles_decoded, percent(cycles_decoded));
-    println!(" ├─ with eligible insts: {} ({:.2}%)", cycles_eligible, percent(cycles_eligible));
-    println!(" └─ with issued insts: {} ({:.2}%)", cycles_issued, percent(cycles_issued));
-    println!(" Warp occupancy with decoded insts: {:.2}", avg_decoded_warps);
-    println!(" Per-warp cycles:");
-    println!(" ├─ with decoded insts [warp 0]: {}", per_warp_cycles_decoded[0]);
-    println!(" ├─ avg. stalls due to write-after-write: {:.2}", avg_warp_stalls_waw);
-    println!(" ├─ avg. stalls due to write-after-read:  {:.2}", avg_warp_stalls_war);
-    println!(" ├─ avg. stalls due to scoreboard full: {:.2}", avg_warp_stalls_scoreboard);
-    println!(" └─ avg. stalls due to busy FUs: {:.2}", avg_warp_stalls_busy);
-    println!("    └─ busy LSU: {:.2}", avg_warp_stalls_busy_lsu);
+    println!(" ├─ with insts in IBUF: {} ({:.2}%)", cycles_decoded, percent(cycles_decoded));
+    println!(" ├─ with insts in RS: {} ({:.2}%)", cycles_dispatched, percent(cycles_dispatched));
+    println!(" ├─ with eligible insts in RS: {} ({:.2}%)", cycles_eligible, percent(cycles_eligible));
+    println!(" └─ with issued insts from RS: {} ({:.2}%)", cycles_issued, percent(cycles_issued));
+    println!(" Decoded warp occupancy in IBUF: {:.2}", avg_decoded_warps);
+    println!(" Active warp occupancy in RS: {:.2}", avg_dispatched_warps);
+    println!(" Eligible warp occupancy in RS: {:.2}", avg_eligible_warps);
+    println!(" Average instruction window in RS: {:.2}", avg_inst_window);
+    println!(" Per-warp stall cycles:");
+    // println!(" ├─ with decoded insts [warp 0]: {}", per_warp_cycles_decoded[0]);
+    // println!(" ├─ with dispatched insts [warp 0]: {}", per_warp_cycles_dispatched[0]);
+    // println!(" ├─ with eligible insts [warp 0]: {}", per_warp_cycles_eligible[0]);
+    println!(" ├─ stalls at RS admission due to write-after-write: {:.2}", avg_warp_stalls_waw);
+    println!(" ├─ stalls at RS admission due to write-after-read:  {:.2}", avg_warp_stalls_war);
+    println!(" ├─ stalls at RS admission due to scoreboard full: {:.2}", avg_warp_stalls_scoreboard);
+    println!(" ├─ stalls at RS admission due to RS full: {:.2}", avg_warp_stalls_rs_full);
+    println!(" ├─ stalls at RS admission due to busy LSU: {:.2}", avg_warp_stalls_busy_lsu);
+    println!(" └─ stalls at RS issue due to other busy FUs: {:.2}", avg_warp_stalls_busy_other);
     println!(" IPC: {:.3}", ipc);
     println!(" GCStack (avg. warps in state per cycle):");
     println!(" ├─ base (issued): {:.2}", avg_base);
@@ -1422,5 +1415,6 @@ pub unsafe extern "C" fn profile_perf_counters_rs(
     println!("");
 }
 
+mod lsu;
 mod mem_model;
 mod tile;

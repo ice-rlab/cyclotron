@@ -328,6 +328,8 @@ impl ExecuteUnit {
             0b010_0010000u16 => InstImp("fsgnjx.s", |[a, b]| { fp32_fsgn_op(a, b, |x, y| { if y.bit(31) { -1.0 * x } else { x } }) }),
             0b000_0010100u16 => InstImp("fmin.s",   |[a, b]| { fp32_op(a, b, |x, y| { fp32_fminmax(x, y, true) }) }),
             0b001_0010100u16 => InstImp("fmax.s",   |[a, b]| { fp32_op(a, b, |x, y| { fp32_fminmax(x, y, false) }) }),
+            0b000_0010110u16 => InstImp("fmin.h",   |[a, b]| { bf16_op(a, b, |x, y| { if x.to_f32() < y.to_f32() { x } else { y } }) }),
+            0b001_0010110u16 => InstImp("fmax.h",   |[a, b]| { bf16_op(a, b, |x, y| { if x.to_f32() > y.to_f32() { x } else { y } }) }),
             0b010_1010000u16 => InstImp("feq.s",    |[a, b]| { fp32_cmp_op(a, b, |x, y| { x == y }) }),
             0b001_1010000u16 => InstImp("flt.s",    |[a, b]| { fp32_cmp_op(a, b, |x, y| { x < y }) }),
             0b000_1010000u16 => InstImp("fle.s",    |[a, b]| { fp32_cmp_op(a, b, |x, y| { x <= y }) }),
@@ -620,6 +622,30 @@ impl ExecuteUnit {
         )
     }
 
+    pub fn custom3(issued_inst: &IssuedInst, lane: usize) -> Option<u32> {
+        let insts = phf_map! {
+            0b111_0101110u16 => InstImp("fexp.h", |[a]| {
+                let result = bf16::from_f32(bf16::from_bits((a & 0xffff) as u16).to_f32().exp())
+                    .to_bits();
+                if [0xffc0, 0x7fff, 0xffff].contains(&result) {
+                    0x7fc0
+                } else {
+                    sign_ext::<16>(result as u32) as u32
+                }
+            }),
+        };
+
+        insts
+            .get(&(f3_f7_mask!(issued_inst.f3, issued_inst.f7)))
+            .and_then(|imp| {
+                Some(print_and_execute!(
+                    imp,
+                    [issued_inst.rs1_data[lane].unwrap()]
+                ))
+            })
+            .or_else(|| panic!("unimplemented custom3 instruction"))
+    }
+
     /// Collect source operand values from the regfile.
     pub fn collect(ibuf: &MicroOp, rf: &[RegFile]) -> IssuedInst {
         let decoded = ibuf.inst;
@@ -750,6 +776,7 @@ impl ExecuteUnit {
                 let imp = match issued.f3 {
                     0 => InstDef("fence", 0),
                     1 => InstDef("fence.i", 1),
+                    2 => InstDef("fence.s", 2),
                     _ => panic!("unimplemented"),
                 };
                 print_and_unwrap!(imp);
@@ -796,6 +823,11 @@ impl ExecuteUnit {
                 neutrino.execute(&issued, cid, wid, tmask, &mut rf[first_lid]);
                 (empty, empty_mem, empty_swb)
             }
+            Opcode::CUSTOM3 => (
+                Self::collect_lanes(|lane| ExecuteUnit::custom3(&issued, lane), tmask, rf),
+                empty_mem,
+                empty_swb,
+            ),
             _ => {
                 panic!("unimplemented opcode 0x{:x}", issued.opcode);
             }
